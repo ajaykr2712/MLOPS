@@ -4,6 +4,8 @@ This project demonstrates an end-to-end pipeline for deploying a simple Machine 
 
 ## This project doc is all about the integration of Machine Learning model simple into a best known Devops tool that together converts as an MLOPS thing
 
+### Detailed tech stack is shown for the users reference 
+
 ## Tech Stack
 ML Framework: Scikit-learn (Simple Linear Regression)
 Frontend: Streamlit

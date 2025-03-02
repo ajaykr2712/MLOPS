@@ -10,4 +10,3 @@ Backend: Flask (Optional, if using API-based architecture)
 Containerization: Docker
 CI/CD: GitHub Actions
 Deployment Options: AWS/GCP/Azure (using Docker or Kubernetes)
-

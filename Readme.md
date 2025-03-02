@@ -1,7 +1,7 @@
 # MLOps Project Structure
 
 This document outlines a comprehensive directory structure for implementing MLOps projects, including all essential components for the full machine learning lifecycle.
-
+https://www.databricks.com/sites/default/files/inline-images/mlops-cycle.png?v=1673970772
 ## Directory Structure
 
 ```

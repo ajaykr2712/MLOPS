@@ -10,3 +10,21 @@ Backend: Flask (Optional, if using API-based architecture)
 Containerization: Docker
 CI/CD: GitHub Actions
 Deployment Options: AWS (using Docker or Kubernetes)
+
+
+
+# HLD
+```mermaid
+graph TD;
+    A[Start: Data Collection] --> B[Data Preprocessing]
+    B --> C[Train Model using Scikit-learn]
+    C --> D[Evaluate Model Performance]
+    D --> E[Save Trained Model]
+    E -->|Containerization| F[Create Docker Container]
+    F -->|Deploy| G[Deploy on AWS using Docker/Kubernetes]
+    G -->|Serve Predictions| H[Frontend with Streamlit]
+    H -->|User Input| I[Model Prediction]
+    I -->|Monitor| J[Logging & Monitoring with Prometheus/AWS CloudWatch]
+    J -->|Automate| K[CI/CD using GitHub Actions]
+    K --> L[Continuous Integration & Deployment]
+    L --> M[End-to-End Deployment Complete]

@@ -11,7 +11,7 @@ To configure the EC2 instance using Cloud9, you need to run commands to observe 
 
 Step Three: Installing the Café Application
 To install the café application, you need to run wget commands to download and extract the web server application files, which were saved on S3. You then need to unzip the cafe.zip file and move its content to the HTML directory.
-
+ 
 Deploying a Dynamic Website for a Café on AWS
 To deploy a dynamic website for a café on AWS, you can use the following steps:
 

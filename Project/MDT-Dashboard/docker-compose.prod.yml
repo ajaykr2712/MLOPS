@@ -1,0 +1,308 @@
+version: '3.8'
+
+services:
+  # Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: mdt-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-mdt_dashboard}
+      POSTGRES_USER: ${DB_USER:-mdt_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secure_password}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-mdt_user} -d ${DB_NAME:-mdt_dashboard}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: mdt-redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_password}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_password}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+  # MLflow Tracking Server
+  mlflow:
+    image: python:3.11-slim
+    container_name: mdt-mlflow
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql://${DB_USER:-mdt_user}:${DB_PASSWORD:-secure_password}@postgres:5432/${DB_NAME:-mdt_dashboard}
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: /mlflow/artifacts
+      MLFLOW_SERVER_HOST: 0.0.0.0
+      MLFLOW_SERVER_PORT: 5000
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    command: >
+      bash -c "
+        pip install mlflow[extras] psycopg2-binary &&
+        mlflow server
+        --backend-store-uri postgresql://${DB_USER:-mdt_user}:${DB_PASSWORD:-secure_password}@postgres:5432/${DB_NAME:-mdt_dashboard}
+        --default-artifact-root /mlflow/artifacts
+        --host 0.0.0.0
+        --port 5000
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mdt-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+  # Grafana Visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mdt-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin_password}
+      GF_INSTALL_PLUGINS: grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+  # MDT Dashboard API
+  mdt-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+      target: production
+    container_name: mdt-api
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-mdt_user}:${DB_PASSWORD:-secure_password}@postgres:5432/${DB_NAME:-mdt_dashboard}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379/1
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SECRET_KEY: ${SECRET_KEY:-your-super-secret-key-change-in-production}
+      API_V1_STR: /api/v1
+      PROJECT_NAME: "MDT Dashboard"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+  # MDT Dashboard UI
+  mdt-dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+      target: production
+    container_name: mdt-dashboard
+    environment:
+      API_BASE_URL: http://mdt-api:8000
+      STREAMLIT_SERVER_PORT: 8501
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    depends_on:
+      mdt-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+  # Celery Worker
+  mdt-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      target: production
+    container_name: mdt-worker
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-mdt_user}:${DB_PASSWORD:-secure_password}@postgres:5432/${DB_NAME:-mdt_dashboard}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379/1
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+  # Celery Beat Scheduler
+  mdt-beat:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      target: production
+    container_name: mdt-beat
+    environment:
+      DATABASE_URL: postgresql://${DB_USER:-mdt_user}:${DB_PASSWORD:-secure_password}@postgres:5432/${DB_NAME:-mdt_dashboard}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379/0
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379/1
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: ["poetry", "run", "celery", "-A", "mdt_dashboard.worker", "beat", "--loglevel=info"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+  # Flower - Celery Monitoring
+  flower:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+      target: production
+    container_name: mdt-flower
+    environment:
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-redis_password}@redis:6379/0
+      FLOWER_PORT: 5555
+    ports:
+      - "${FLOWER_PORT:-5555}:5555"
+    command: ["poetry", "run", "celery", "-A", "mdt_dashboard.worker", "flower", "--port=5555"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+  # Nginx Load Balancer & Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: mdt-nginx
+    volumes:
+      - ./config/nginx.conf:/etc/nginx/nginx.conf
+      - ./config/ssl:/etc/nginx/ssl
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - mdt-api
+      - mdt-dashboard
+    restart: unless-stopped
+    networks:
+      - mdt-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  mlflow_artifacts:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  mdt-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

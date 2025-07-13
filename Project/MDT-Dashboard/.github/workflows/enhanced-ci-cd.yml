@@ -1,0 +1,695 @@
+name: MDT Dashboard - Enhanced CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop, release/*]
+    tags: ['v*']
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Run nightly builds at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+      skip_tests:
+        description: 'Skip test execution'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "18"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/mdt-dashboard
+  CHART_VERSION: "1.0.0"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Metadata and Change Detection
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      should_deploy: ${{ steps.changes.outputs.should_deploy }}
+      python_changed: ${{ steps.changes.outputs.python }}
+      docker_changed: ${{ steps.changes.outputs.docker }}
+      k8s_changed: ${{ steps.changes.outputs.k8s }}
+      docs_changed: ${{ steps.changes.outputs.docs }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION="$(date +'%Y%m%d')-${GITHUB_SHA::8}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Detect changes
+        id: changes
+        uses: dorny/paths-filter@v2
+        with:
+          filters: |
+            python:
+              - 'src/**/*.py'
+              - 'tests/**/*.py'
+              - 'pyproject.toml'
+              - 'poetry.lock'
+              - 'requirements*.txt'
+            docker:
+              - 'docker/**'
+              - 'Dockerfile*'
+              - 'docker-compose*.yml'
+            k8s:
+              - 'k8s/**'
+              - 'charts/**'
+              - 'scripts/deploy.sh'
+            docs:
+              - 'docs/**'
+              - '*.md'
+              - 'mkdocs.yml'
+            should_deploy:
+              - 'src/**'
+              - 'docker/**'
+              - 'k8s/**'
+              - 'pyproject.toml'
+
+  # Code Quality and Security Scanning
+  quality-gate:
+    runs-on: ubuntu-latest
+    needs: metadata
+    if: needs.metadata.outputs.python_changed == 'true' || github.event_name == 'schedule'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            venv-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+
+      - name: Install dependencies
+        run: |
+          poetry install --with dev
+          poetry run pip install pre-commit
+
+      - name: Run pre-commit hooks
+        run: poetry run pre-commit run --all-files
+
+      - name: Code formatting (Black)
+        run: poetry run black --check --diff src/ tests/
+
+      - name: Import sorting (isort)
+        run: poetry run isort --check-only --diff src/ tests/
+
+      - name: Linting (flake8)
+        run: poetry run flake8 src/ tests/ --statistics
+
+      - name: Type checking (mypy)
+        run: poetry run mypy src/ --ignore-missing-imports
+
+      - name: Security scanning (bandit)
+        run: poetry run bandit -r src/ -f json -o bandit-report.json || true
+
+      - name: Dependency vulnerability check (safety)
+        run: poetry run safety check --json --output safety-report.json || true
+
+      - name: Upload security reports
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+
+  # Comprehensive Testing Suite
+  test-suite:
+    runs-on: ubuntu-latest
+    needs: [metadata, quality-gate]
+    if: needs.metadata.outputs.python_changed == 'true' || github.event_name == 'schedule'
+    
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11"]
+        test-type: ["unit", "integration", "e2e"]
+        exclude:
+          - python-version: "3.9"
+            test-type: "e2e"
+          - python-version: "3.10"
+            test-type: "e2e"
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_USER: testuser
+          POSTGRES_DB: mdt_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
+
+      mlflow:
+        image: ghcr.io/mlflow/mlflow:latest
+        env:
+          MLFLOW_BACKEND_STORE_URI: postgresql://testuser:testpassword@postgres:5432/mdt_test
+          MLFLOW_DEFAULT_ARTIFACT_ROOT: /tmp/mlflow-artifacts
+        ports:
+          - 5000:5000
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+
+      - name: Install dependencies
+        run: poetry install --with dev
+
+      - name: Wait for services
+        run: |
+          sleep 30
+          timeout 60 bash -c 'until nc -z localhost 5432; do sleep 1; done'
+          timeout 60 bash -c 'until nc -z localhost 6379; do sleep 1; done'
+
+      - name: Set up test environment
+        env:
+          DATABASE_URL: postgresql://testuser:testpassword@localhost:5432/mdt_test
+          REDIS_URL: redis://localhost:6379/0
+          MLFLOW_TRACKING_URI: http://localhost:5000
+          ENVIRONMENT: testing
+        run: |
+          poetry run alembic upgrade head
+
+      - name: Run unit tests
+        if: matrix.test-type == 'unit'
+        env:
+          DATABASE_URL: postgresql://testuser:testpassword@localhost:5432/mdt_test
+          REDIS_URL: redis://localhost:6379/0
+          MLFLOW_TRACKING_URI: http://localhost:5000
+          ENVIRONMENT: testing
+        run: |
+          poetry run pytest tests/unit/ -v \
+            --cov=src/mdt_dashboard \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term \
+            --junit-xml=junit-unit.xml \
+            --cov-fail-under=80
+
+      - name: Run integration tests
+        if: matrix.test-type == 'integration'
+        env:
+          DATABASE_URL: postgresql://testuser:testpassword@localhost:5432/mdt_test
+          REDIS_URL: redis://localhost:6379/0
+          MLFLOW_TRACKING_URI: http://localhost:5000
+          ENVIRONMENT: testing
+        run: |
+          poetry run pytest tests/integration/ -v \
+            --junit-xml=junit-integration.xml \
+            -x
+
+      - name: Run end-to-end tests
+        if: matrix.test-type == 'e2e'
+        env:
+          DATABASE_URL: postgresql://testuser:testpassword@localhost:5432/mdt_test
+          REDIS_URL: redis://localhost:6379/0
+          MLFLOW_TRACKING_URI: http://localhost:5000
+          ENVIRONMENT: testing
+        run: |
+          # Start services in background
+          poetry run uvicorn mdt_dashboard.api.main:app --host 0.0.0.0 --port 8000 &
+          poetry run streamlit run mdt_dashboard/dashboard/main.py --server.port 8501 &
+          
+          # Wait for services to start
+          sleep 30
+          
+          # Run E2E tests
+          poetry run pytest tests/e2e/ -v \
+            --junit-xml=junit-e2e.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-${{ matrix.python-version }}-${{ matrix.test-type }}
+          path: |
+            junit-*.xml
+            htmlcov/
+            coverage.xml
+
+      - name: Upload coverage to Codecov
+        if: matrix.test-type == 'unit' && matrix.python-version == '3.11'
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+
+  # Container Security and Vulnerability Scanning
+  container-security:
+    runs-on: ubuntu-latest
+    needs: [metadata]
+    if: needs.metadata.outputs.docker_changed == 'true' || github.event_name == 'schedule'
+    
+    strategy:
+      matrix:
+        service: [api, dashboard, worker]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image for scanning
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.${{ matrix.service }}
+          tags: mdt-${{ matrix.service }}:scan
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: mdt-${{ matrix.service }}:scan
+          format: 'sarif'
+          output: 'trivy-${{ matrix.service }}-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-${{ matrix.service }}-results.sarif'
+          category: 'trivy-${{ matrix.service }}'
+
+      - name: Run Docker Scout (if available)
+        if: github.repository_owner == 'aponduga'
+        run: |
+          echo "Running Docker Scout analysis for ${{ matrix.service }}"
+          # Docker Scout integration would go here
+
+  # Build and Push Multi-Architecture Images
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [metadata, quality-gate, test-suite]
+    if: |
+      (needs.metadata.outputs.should_deploy == 'true' || github.event_name == 'schedule') &&
+      (github.event_name != 'pull_request')
+    
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    strategy:
+      matrix:
+        service: [api, dashboard, worker]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=${{ needs.metadata.outputs.version }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.${{ matrix.service }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            VERSION=${{ needs.metadata.outputs.version }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VCS_REF=${{ github.sha }}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}:${{ needs.metadata.outputs.version }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.service }}.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.spdx.json
+
+      - name: Sign container image
+        if: github.event_name != 'pull_request'
+        env:
+          COSIGN_EXPERIMENTAL: 1
+        run: |
+          # Install cosign
+          curl -O -L "https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64"
+          sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+          sudo chmod +x /usr/local/bin/cosign
+          
+          # Sign the image
+          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}@${{ steps.build.outputs.digest }}
+
+  # Performance and Load Testing
+  performance-testing:
+    runs-on: ubuntu-latest
+    needs: [metadata, build-and-push]
+    if: |
+      github.ref == 'refs/heads/develop' || 
+      github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+
+      - name: Start test environment
+        run: |
+          docker-compose -f docker-compose.yml up -d
+          sleep 60  # Wait for services to be ready
+
+      - name: Run API load tests
+        run: |
+          k6 run tests/performance/api_load_test.js \
+            --out json=api-performance-results.json
+
+      - name: Run dashboard performance tests
+        run: |
+          k6 run tests/performance/dashboard_load_test.js \
+            --out json=dashboard-performance-results.json
+
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: |
+            *-performance-results.json
+
+      - name: Cleanup test environment
+        if: always()
+        run: docker-compose down -v
+
+  # Infrastructure Validation
+  infrastructure-validation:
+    runs-on: ubuntu-latest
+    needs: [metadata]
+    if: needs.metadata.outputs.k8s_changed == 'true' || github.event_name == 'schedule'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Kubernetes tools
+        run: |
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+          
+          # Install helm
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          
+          # Install kubeval
+          wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+          tar xf kubeval-linux-amd64.tar.gz
+          sudo mv kubeval /usr/local/bin
+
+      - name: Validate Kubernetes manifests
+        run: |
+          find k8s/ -name "*.yaml" -o -name "*.yml" | xargs kubeval
+
+      - name: Lint Helm charts (if present)
+        run: |
+          if [ -d "charts/" ]; then
+            helm lint charts/*/
+          fi
+
+      - name: Test deployment script
+        run: |
+          bash -n scripts/deploy.sh
+
+  # Documentation Build and Deployment
+  documentation:
+    runs-on: ubuntu-latest
+    needs: [metadata]
+    if: |
+      github.ref == 'refs/heads/main' || 
+      needs.metadata.outputs.docs_changed == 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install documentation dependencies
+        run: |
+          pip install mkdocs mkdocs-material mkdocs-mermaid2-plugin
+          pip install mkdocs-swagger-ui-tag
+
+      - name: Build documentation
+        run: |
+          mkdocs build --strict
+
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./site
+          cname: mdt-dashboard.example.com
+
+  # Deploy to Staging
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [metadata, build-and-push, performance-testing]
+    if: |
+      github.ref == 'refs/heads/develop' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment: 
+      name: staging
+      url: https://staging.mdt-dashboard.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to staging
+        env:
+          KUBECONFIG_DATA: ${{ secrets.STAGING_KUBECONFIG }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          echo "$KUBECONFIG_DATA" | base64 -d > kubeconfig.yaml
+          export KUBECONFIG=kubeconfig.yaml
+          
+          # Deploy using the deployment script
+          bash scripts/deploy.sh staging $VERSION
+
+      - name: Run smoke tests
+        run: |
+          # Wait for deployment to be ready
+          sleep 120
+          
+          # Run smoke tests
+          curl -f https://staging.mdt-dashboard.example.com/health || exit 1
+          curl -f https://staging.mdt-dashboard.example.com/api/v1/health || exit 1
+
+      - name: Notify deployment
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        if: always()
+
+  # Deploy to Production
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: [metadata, build-and-push, deploy-staging]
+    if: |
+      github.ref == 'refs/heads/main' || 
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment: 
+      name: production
+      url: https://mdt-dashboard.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production
+        env:
+          KUBECONFIG_DATA: ${{ secrets.PRODUCTION_KUBECONFIG }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          echo "$KUBECONFIG_DATA" | base64 -d > kubeconfig.yaml
+          export KUBECONFIG=kubeconfig.yaml
+          
+          # Deploy using the deployment script
+          bash scripts/deploy.sh production $VERSION
+
+      - name: Run production smoke tests
+        run: |
+          # Wait for deployment to be ready
+          sleep 180
+          
+          # Run comprehensive smoke tests
+          curl -f https://mdt-dashboard.example.com/health || exit 1
+          curl -f https://mdt-dashboard.example.com/api/v1/health || exit 1
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+
+      - name: Notify production deployment
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#production-deployments'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        if: always()
+
+  # Cleanup and Monitoring
+  post-deployment:
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: always()
+    
+    steps:
+      - name: Update monitoring dashboards
+        run: |
+          echo "Updating Grafana dashboards with new deployment version"
+          # Update monitoring configurations
+
+      - name: Cleanup old container images
+        run: |
+          echo "Cleaning up old container images from registry"
+          # Implement cleanup logic for old images
+
+      - name: Generate deployment report
+        run: |
+          echo "# Deployment Report" >> deployment-report.md
+          echo "- Version: ${{ needs.metadata.outputs.version }}" >> deployment-report.md
+          echo "- Deployment Time: $(date)" >> deployment-report.md
+          echo "- Git SHA: ${{ github.sha }}" >> deployment-report.md
+
+      - name: Upload deployment report
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-report
+          path: deployment-report.md

@@ -1,0 +1,83 @@
+# Multi-stage Dockerfile for API Service
+FROM python:3.11-slim as base
+
+# Set environment variables
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    POETRY_VERSION=1.6.1
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    git \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Poetry
+RUN pip install poetry==$POETRY_VERSION
+
+# Configure poetry
+ENV POETRY_NO_INTERACTION=1 \
+    POETRY_VENV_IN_PROJECT=1 \
+    POETRY_CACHE_DIR=/tmp/poetry_cache
+
+# Development stage
+FROM base as development
+
+WORKDIR /app
+
+# Copy poetry files
+COPY pyproject.toml poetry.lock ./
+
+# Install dependencies
+RUN poetry install --with dev && rm -rf $POETRY_CACHE_DIR
+
+# Copy application code
+COPY . .
+
+# Install the application
+RUN poetry install
+
+# Expose port
+EXPOSE 8000
+
+# Command for development
+CMD ["poetry", "run", "uvicorn", "mdt_dashboard.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+
+# Production stage
+FROM base as production
+
+WORKDIR /app
+
+# Copy poetry files
+COPY pyproject.toml poetry.lock ./
+
+# Install only production dependencies
+RUN poetry install --only=main && rm -rf $POETRY_CACHE_DIR
+
+# Copy application code
+COPY src/ ./src/
+COPY alembic/ ./alembic/
+COPY alembic.ini ./
+
+# Install the application
+RUN poetry install --only=main
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+RUN chown -R appuser:appuser /app
+USER appuser
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Expose port
+EXPOSE 8000
+
+# Command for production
+CMD ["poetry", "run", "gunicorn", "mdt_dashboard.api.main:app", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000", "--workers", "4", "--worker-connections", "1000", "--max-requests", "1000", "--max-requests-jitter", "100"]

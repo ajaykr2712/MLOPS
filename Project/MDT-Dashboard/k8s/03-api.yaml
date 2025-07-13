@@ -1,0 +1,164 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mdt-api
+  namespace: mdt-dashboard
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mdt-api
+  template:
+    metadata:
+      labels:
+        app: mdt-api
+    spec:
+      containers:
+      - name: mdt-api
+        image: ghcr.io/your-org/mdt-dashboard-api:latest
+        env:
+        - name: DATABASE_URL
+          value: "postgresql://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)"
+        - name: REDIS_URL
+          value: "redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0"
+        - name: CELERY_BROKER_URL
+          value: "redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/0"
+        - name: CELERY_RESULT_BACKEND
+          value: "redis://:$(REDIS_PASSWORD)@$(REDIS_HOST):$(REDIS_PORT)/1"
+        - name: MLFLOW_TRACKING_URI
+          value: "http://$(MLFLOW_HOST):$(MLFLOW_PORT)"
+        - name: DB_USER
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: DB_USER
+        - name: DB_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: DB_HOST
+        - name: DB_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: DB_PORT
+        - name: DB_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: DB_NAME
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: REDIS_HOST
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: REDIS_PORT
+        - name: MLFLOW_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: MLFLOW_HOST
+        - name: MLFLOW_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: MLFLOW_PORT
+        - name: ENVIRONMENT
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: ENVIRONMENT
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: LOG_LEVEL
+        - name: API_V1_STR
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: API_V1_STR
+        - name: PROJECT_NAME
+          valueFrom:
+            configMapKeyRef:
+              name: mdt-config
+              key: PROJECT_NAME
+        - name: DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mdt-secrets
+              key: DB_PASSWORD
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mdt-secrets
+              key: REDIS_PASSWORD
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: mdt-secrets
+              key: SECRET_KEY
+        ports:
+        - containerPort: 8000
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mdt-api
+  namespace: mdt-dashboard
+spec:
+  selector:
+    app: mdt-api
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: mdt-api-hpa
+  namespace: mdt-dashboard
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: mdt-api
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80

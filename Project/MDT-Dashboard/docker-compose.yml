@@ -1,0 +1,182 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: mdt-postgres
+    environment:
+      POSTGRES_DB: mdt_db
+      POSTGRES_USER: mdt_user
+      POSTGRES_PASSWORD: mdt_pass
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mdt_user -d mdt_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mdt-network
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: mdt-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - mdt-network
+
+  # MLflow Tracking Server
+  mlflow:
+    image: python:3.9-slim
+    container_name: mdt-mlflow
+    working_dir: /mlflow
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=postgresql://mdt_user:mdt_pass@postgres:5432/mdt_db
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlflow/artifacts
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_artifacts:/mlflow/artifacts
+    command: >
+      bash -c "
+        pip install mlflow psycopg2-binary &&
+        mlflow server 
+          --backend-store-uri postgresql://mdt_user:mdt_pass@postgres:5432/mdt_db
+          --default-artifact-root /mlflow/artifacts
+          --host 0.0.0.0
+          --port 5000
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - mdt-network
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: mdt-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - mdt-network
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: mdt-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./docker/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - mdt-network
+
+  # MDT API Server
+  mdt-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    container_name: mdt-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://mdt_user:mdt_pass@postgres:5432/mdt_db
+      - REDIS_URL=redis://redis:6379/0
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - ENVIRONMENT=production
+      - DEBUG=false
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mdt-network
+    restart: unless-stopped
+
+  # MDT Dashboard
+  mdt-dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.dashboard
+    container_name: mdt-dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - API_ENDPOINT=http://mdt-api:8000
+    depends_on:
+      - mdt-api
+    networks:
+      - mdt-network
+    restart: unless-stopped
+
+  # MDT Worker (for background tasks)
+  mdt-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    container_name: mdt-worker
+    environment:
+      - DATABASE_URL=postgresql://mdt_user:mdt_pass@postgres:5432/mdt_db
+      - REDIS_URL=redis://redis:6379/0
+      - WORKER_CONCURRENCY=4
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mdt-network
+    restart: unless-stopped
+
+networks:
+  mdt-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  mlflow_artifacts:
+  prometheus_data:
+  grafana_data:

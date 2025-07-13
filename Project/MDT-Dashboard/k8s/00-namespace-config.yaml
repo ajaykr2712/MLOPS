@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mdt-dashboard
+  labels:
+    name: mdt-dashboard
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mdt-config
+  namespace: mdt-dashboard
+data:
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "info"
+  API_V1_STR: "/api/v1"
+  PROJECT_NAME: "MDT Dashboard"
+  DB_NAME: "mdt_dashboard"
+  DB_USER: "mdt_user"
+  DB_HOST: "postgres"
+  DB_PORT: "5432"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  MLFLOW_HOST: "mlflow"
+  MLFLOW_PORT: "5000"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mdt-secrets
+  namespace: mdt-dashboard
+type: Opaque
+data:
+  # Base64 encoded values
+  DB_PASSWORD: c2VjdXJlX3Bhc3N3b3Jk  # secure_password
+  REDIS_PASSWORD: cmVkaXNfcGFzc3dvcmQ=  # redis_password
+  SECRET_KEY: eW91ci1zdXBlci1zZWNyZXQta2V5LWNoYW5nZS1pbi1wcm9kdWN0aW9u  # your-super-secret-key-change-in-production
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: mdt-dashboard
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-pvc
+  namespace: mdt-dashboard
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  storageClassName: standard
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mlflow-pvc
+  namespace: mdt-dashboard
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard

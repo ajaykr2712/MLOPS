@@ -12,10 +12,24 @@ from pathlib import Path
 import time
 import requests
 import json
+import logging
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+import warnings
+warnings.filterwarnings("ignore")
 
 # Add src to Python path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root / "src"))
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Global configuration
+API_BASE_URL = "http://localhost:8000"
+DASHBOARD_URL = "http://localhost:8501"
 
 def create_sample_data():
     """Create sample training and test data."""
@@ -158,57 +172,315 @@ def create_sample_predictions():
         return []
 
 
-def test_api_endpoints():
-    """Test API endpoints to ensure they're working."""
-    print("🔧 Testing API endpoints...")
+def test_api_connection(base_url=API_BASE_URL):
+    """Test connection to the API server."""
+    print(f"🔗 Testing API connection to {base_url}")
     
-    api_base = "http://localhost:8000"
-    
-    # Test health endpoint
     try:
-        response = requests.get(f"{api_base}/health", timeout=5)
+        response = requests.get(f"{base_url}/health", timeout=10)
         if response.status_code == 200:
-            print("✅ Health endpoint working")
+            health_data = response.json()
+            print("✅ API server is healthy!")
+            print(f"   Version: {health_data.get('version', 'Unknown')}")
+            print(f"   Environment: {health_data.get('environment', 'Unknown')}")
+            print(f"   Database: {health_data.get('database', 'Unknown')}")
+            return True
         else:
-            print(f"❌ Health endpoint failed: {response.status_code}")
+            print(f"❌ API health check failed: {response.status_code}")
+            return False
     except Exception as e:
-        print(f"❌ Health endpoint failed: {e}")
+        print(f"❌ Could not connect to API: {e}")
+        print("💡 Make sure the API server is running: python cli.py api")
+        return False
+
+
+def test_model_endpoints(base_url=API_BASE_URL):
+    """Test model-related API endpoints."""
+    print("🤖 Testing model endpoints...")
     
-    # Test models endpoint
     try:
-        response = requests.get(f"{api_base}/api/v1/models", timeout=5)
+        # Test models list endpoint
+        response = requests.get(f"{base_url}/api/v1/models", timeout=10)
         if response.status_code == 200:
-            models = response.json()
-            print(f"✅ Models endpoint working ({len(models.get('models', []))} models)")
+            models_data = response.json()
+            models = models_data.get('models', [])
+            print(f"✅ Found {len(models)} models in registry")
+            
+            if models:
+                for model in models[:3]:  # Show first 3 models
+                    print(f"   📦 {model.get('name', 'Unknown')} - {model.get('status', 'Unknown')}")
         else:
             print(f"❌ Models endpoint failed: {response.status_code}")
     except Exception as e:
-        print(f"❌ Models endpoint failed: {e}")
+        print(f"❌ Models endpoint error: {e}")
+
+
+def test_prediction_api(base_url=API_BASE_URL):
+    """Test prediction API with sample data."""
+    print("🔮 Testing prediction API...")
     
-    # Test prediction endpoint
-    try:
-        sample_data = {
+    # Sample prediction data
+    sample_data = {
+        "model_id": "customer_churn_demo",
+        "input_data": {
             "age": 35,
-            "income": 50000,
-            "tenure_months": 24,
-            "monthly_charges": 75.0,
-            "total_charges": 1800.0
-        }
+            "income": 55000.0,
+            "tenure_months": 18,
+            "monthly_charges": 75.50,
+            "total_charges": 1359.0
+        },
+        "detect_drift": True,
+        "store_prediction": True
+    }
+    
+    try:
+        response = requests.post(
+            f"{base_url}/api/v1/predict",
+            json=sample_data,
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
         
-        payload = {
-            "model_id": "customer_churn_demo",
-            "input_data": sample_data,
-            "detect_drift": True
-        }
-        
-        response = requests.post(f"{api_base}/api/v1/predict", json=payload, timeout=10)
         if response.status_code == 200:
             result = response.json()
-            print(f"✅ Prediction endpoint working (prediction: {result.get('prediction')})")
+            print("✅ Prediction successful!")
+            print(f"   🎯 Prediction: {result.get('prediction')}")
+            print(f"   📊 Probability: {result.get('prediction_probability')}")
+            print(f"   ⚠️  Drift detected: {result.get('drift_detected', 'N/A')}")
+            print(f"   ⏱️  Response time: {result.get('response_time_ms', 0):.1f}ms")
+            return result
         else:
-            print(f"❌ Prediction endpoint failed: {response.status_code}")
+            print(f"❌ Prediction failed: {response.status_code}")
+            print(f"   Error: {response.text}")
+            return None
     except Exception as e:
-        print(f"❌ Prediction endpoint failed: {e}")
+        print(f"❌ Prediction API error: {e}")
+        return None
+
+
+def test_batch_predictions(base_url=API_BASE_URL, num_samples=5):
+    """Test batch prediction performance."""
+    print(f"📊 Testing batch predictions ({num_samples} samples)...")
+    
+    # Generate batch data
+    batch_data = []
+    for i in range(num_samples):
+        batch_data.append({
+            "age": np.random.randint(20, 70),
+            "income": np.random.uniform(30000, 100000),
+            "tenure_months": np.random.randint(1, 60),
+            "monthly_charges": np.random.uniform(30, 150),
+            "total_charges": np.random.uniform(100, 5000)
+        })
+    
+    start_time = time.time()
+    successful_predictions = 0
+    
+    for i, data in enumerate(batch_data):
+        try:
+            response = requests.post(
+                f"{base_url}/api/v1/predict",
+                json={
+                    "model_id": "customer_churn_demo",
+                    "input_data": data,
+                    "detect_drift": True
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                successful_predictions += 1
+                if i == 0:  # Log first prediction
+                    result = response.json()
+                    print(f"   Sample prediction: {result.get('prediction')}")
+            else:
+                print(f"   ❌ Prediction {i+1} failed: {response.status_code}")
+                
+        except Exception as e:
+            print(f"   ❌ Prediction {i+1} error: {e}")
+    
+    total_time = time.time() - start_time
+    avg_time = (total_time / num_samples) * 1000  # ms per prediction
+    
+    print(f"✅ Batch prediction results:")
+    print(f"   📈 Success rate: {successful_predictions}/{num_samples} ({100*successful_predictions/num_samples:.1f}%)")
+    print(f"   ⏱️  Average time: {avg_time:.1f}ms per prediction")
+    print(f"   🔄 Total time: {total_time:.2f}s")
+
+
+def test_drift_detection_api(base_url=API_BASE_URL):
+    """Test drift detection API endpoint."""
+    print("🔍 Testing drift detection API...")
+    
+    try:
+        drift_request = {
+            "model_id": "customer_churn_demo",
+            "time_window_hours": 24,
+            "drift_threshold": 0.05
+        }
+        
+        response = requests.post(
+            f"{base_url}/api/v1/drift/check",
+            json=drift_request,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            print("✅ Drift check initiated!")
+            print(f"   📝 Task ID: {result.get('task_id', 'N/A')}")
+            print(f"   🕒 Time window: {result.get('time_window_hours', 0)} hours")
+        else:
+            print(f"❌ Drift check failed: {response.status_code}")
+            print(f"   Error: {response.text}")
+    except Exception as e:
+        print(f"❌ Drift detection error: {e}")
+
+
+def test_metrics_endpoint(base_url=API_BASE_URL):
+    """Test Prometheus metrics endpoint."""
+    print("📊 Testing metrics endpoint...")
+    
+    try:
+        response = requests.get(f"{base_url}/metrics", timeout=10)
+        if response.status_code == 200:
+            metrics_text = response.text
+            lines = metrics_text.split('\n')
+            
+            # Count different metric types
+            counter_metrics = [line for line in lines if '_total' in line and not line.startswith('#')]
+            histogram_metrics = [line for line in lines if '_bucket' in line and not line.startswith('#')]
+            
+            print("✅ Metrics endpoint accessible!")
+            print(f"   📊 Counter metrics: {len(counter_metrics)}")
+            print(f"   📈 Histogram metrics: {len(histogram_metrics)}")
+            
+            # Show sample metrics
+            print("   📋 Sample metrics:")
+            for line in lines[:10]:
+                if line and not line.startswith('#') and '=' in line:
+                    print(f"      {line[:60]}...")
+                    break
+        else:
+            print(f"❌ Metrics endpoint failed: {response.status_code}")
+    except Exception as e:
+        print(f"❌ Metrics endpoint error: {e}")
+
+
+def demonstrate_local_services():
+    """Demonstrate local SDK functionality."""
+    print("🔧 Testing local services...")
+    
+    try:
+        # Test data processing
+        from src.mdt_dashboard.data_processing import ComprehensiveDataProcessor
+        
+        processor = ComprehensiveDataProcessor()
+        
+        # Create sample data for processing
+        sample_df = pd.DataFrame({
+            'feature1': np.random.normal(0, 1, 100),
+            'feature2': np.random.exponential(2, 100),
+            'category': np.random.choice(['A', 'B', 'C'], 100)
+        })
+        
+        # Test data quality analysis
+        quality_report = processor.analyze_data_quality(sample_df)
+        print(f"✅ Data quality analysis completed")
+        print(f"   📊 Overall score: {quality_report.get('overall_score', 0):.2f}")
+        
+        # Test drift detection
+        from src.mdt_dashboard.drift_detection import DriftDetectionSuite
+        
+        drift_suite = DriftDetectionSuite()
+        
+        # Create reference and current data
+        reference_data = sample_df[:50]
+        current_data = sample_df[50:] * 1.2  # Add some drift
+        
+        drift_results = drift_suite.detect_multivariate_drift(
+            reference_data.select_dtypes(include=[np.number]),
+            current_data.select_dtypes(include=[np.number])
+        )
+        
+        print(f"✅ Drift detection completed")
+        print(f"   🔍 Features analyzed: {len(drift_results)}")
+        
+        # Test prediction service
+        from src.mdt_dashboard.predict import PredictionService
+        
+        pred_service = PredictionService()
+        health = pred_service.get_health_status()
+        print(f"✅ Prediction service healthy")
+        print(f"   📦 Available models: {health.get('available_models', 0)}")
+        
+    except Exception as e:
+        print(f"❌ Local services error: {e}")
+        print(f"   💡 Make sure all dependencies are installed")
+
+
+def run_performance_benchmark(base_url=API_BASE_URL):
+    """Run a comprehensive performance benchmark."""
+    print("🚀 Running performance benchmark...")
+    
+    # Test different payload sizes
+    payload_sizes = [1, 5, 10, 20]
+    results = {}
+    
+    for size in payload_sizes:
+        print(f"   Testing {size} concurrent predictions...")
+        
+        start_time = time.time()
+        successful = 0
+        
+        # Create batch requests
+        import concurrent.futures
+        import threading
+        
+        def make_prediction():
+            try:
+                data = {
+                    "model_id": "customer_churn_demo",
+                    "input_data": {
+                        "age": np.random.randint(20, 70),
+                        "income": np.random.uniform(30000, 100000),
+                        "tenure_months": np.random.randint(1, 60),
+                        "monthly_charges": np.random.uniform(30, 150),
+                        "total_charges": np.random.uniform(100, 5000)
+                    },
+                    "detect_drift": True
+                }
+                
+                response = requests.post(
+                    f"{base_url}/api/v1/predict",
+                    json=data,
+                    timeout=15
+                )
+                return response.status_code == 200
+            except:
+                return False
+        
+        # Run concurrent requests
+        with concurrent.futures.ThreadPoolExecutor(max_workers=size) as executor:
+            futures = [executor.submit(make_prediction) for _ in range(size)]
+            for future in concurrent.futures.as_completed(futures):
+                if future.result():
+                    successful += 1
+        
+        total_time = time.time() - start_time
+        results[size] = {
+            'successful': successful,
+            'total': size,
+            'time': total_time,
+            'rps': size / total_time if total_time > 0 else 0
+        }
+        
+        print(f"      ✅ {successful}/{size} successful ({100*successful/size:.1f}%)")
+        print(f"      ⏱️  {total_time:.2f}s total, {results[size]['rps']:.1f} RPS")
+    
+    print("📊 Performance benchmark summary:")
+    for size, result in results.items():
+        print(f"   {size:2d} concurrent: {result['rps']:5.1f} RPS, {result['successful']:2d}/{result['total']:2d} success")
 
 
 def check_dashboard():
@@ -320,7 +592,12 @@ def main():
         print()
         
         # Test API (if running)
-        test_api_endpoints()
+        test_api_connection()
+        test_model_endpoints()
+        test_prediction_api()
+        test_batch_predictions()
+        test_drift_detection_api()
+        test_metrics_endpoint()
         print()
         
         # Check dashboard

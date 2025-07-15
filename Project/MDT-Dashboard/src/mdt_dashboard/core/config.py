@@ -3,92 +3,261 @@ Core configuration management for MDT Dashboard.
 Enterprise-grade configuration with environment-based settings.
 """
 
+from __future__ import annotations
 from typing import List, Optional
 from pydantic import BaseSettings, Field, validator
 from functools import lru_cache
+from enum import Enum
 
 
-class DatabaseSettings(BaseSettings):
+class Environment(str, Enum):
+    """Application environment types."""
+    DEVELOPMENT = "development"
+    STAGING = "staging"
+    PRODUCTION = "production"
+
+
+class LogLevel(str, Enum):
+    """Logging levels."""
+    DEBUG = "DEBUG"
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    CRITICAL = "CRITICAL"
+
+
+class BaseConfig(BaseSettings):
+    """Base configuration class with common functionality."""
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+        extra = "forbid"  # Prevent extra fields
+        
+    def dict_safe(self) -> dict:
+        """Return dictionary with sensitive fields masked."""
+        data = self.dict()
+        sensitive_fields = {'password', 'secret', 'key', 'token'}
+        
+        def mask_sensitive(obj: dict, path: str = "") -> dict:
+            if isinstance(obj, dict):
+                return {
+                    k: mask_sensitive(v, f"{path}.{k}" if path else k)
+                    for k, v in obj.items()
+                }
+            elif any(sensitive in str(path).lower() for sensitive in sensitive_fields):
+                return "***MASKED***" if obj else None
+            else:
+                return obj
+                
+        return mask_sensitive(data)
+
+
+class DatabaseSettings(BaseConfig):
     """Database configuration settings."""
     
     url: str = Field(
         default="postgresql://mdt_user:mdt_pass@localhost:5432/mdt_db",
-        env="DATABASE_URL"
+        env="DATABASE_URL",
+        description="Database connection URL"
     )
-    echo: bool = Field(default=False, env="DATABASE_ECHO")
-    pool_size: int = Field(default=20, env="DATABASE_POOL_SIZE")
-    max_overflow: int = Field(default=30, env="DATABASE_MAX_OVERFLOW")
+    echo: bool = Field(
+        default=False, 
+        env="DATABASE_ECHO",
+        description="Enable SQL query echoing"
+    )
+    pool_size: int = Field(
+        default=20, 
+        env="DATABASE_POOL_SIZE",
+        ge=1,
+        le=100,
+        description="Database connection pool size"
+    )
+    max_overflow: int = Field(
+        default=30, 
+        env="DATABASE_MAX_OVERFLOW",
+        ge=0,
+        le=100,
+        description="Maximum connection pool overflow"
+    )
     
-    class Config:
+    class Config(BaseConfig.Config):
         env_prefix = "DB_"
 
 
-class RedisSettings(BaseSettings):
+class RedisSettings(BaseConfig):
     """Redis configuration for caching and task queue."""
     
-    url: str = Field(default="redis://localhost:6379/0", env="REDIS_URL")
-    max_connections: int = Field(default=20, env="REDIS_MAX_CONNECTIONS")
-    decode_responses: bool = Field(default=True, env="REDIS_DECODE_RESPONSES")
+    url: str = Field(
+        default="redis://localhost:6379/0", 
+        env="REDIS_URL",
+        description="Redis connection URL"
+    )
+    max_connections: int = Field(
+        default=20, 
+        env="REDIS_MAX_CONNECTIONS",
+        ge=1,
+        le=100,
+        description="Maximum Redis connections"
+    )
+    decode_responses: bool = Field(
+        default=True, 
+        env="REDIS_DECODE_RESPONSES",
+        description="Decode Redis responses"
+    )
     
-    class Config:
+    class Config(BaseConfig.Config):
         env_prefix = "REDIS_"
 
 
-class MonitoringSettings(BaseSettings):
+class MonitoringSettings(BaseConfig):
     """Monitoring and observability settings."""
     
-    prometheus_port: int = Field(default=8000, env="PROMETHEUS_PORT")
-    metrics_path: str = Field(default="/metrics", env="METRICS_PATH")
-    enable_jaeger: bool = Field(default=False, env="ENABLE_JAEGER")
-    jaeger_agent_host: str = Field(default="localhost", env="JAEGER_AGENT_HOST")
-    jaeger_agent_port: int = Field(default=6831, env="JAEGER_AGENT_PORT")
-    log_level: str = Field(default="INFO", env="LOG_LEVEL")
+    prometheus_port: int = Field(
+        default=8000, 
+        env="PROMETHEUS_PORT",
+        ge=1024,
+        le=65535,
+        description="Prometheus metrics port"
+    )
+    metrics_path: str = Field(
+        default="/metrics", 
+        env="METRICS_PATH",
+        description="Metrics endpoint path"
+    )
+    enable_jaeger: bool = Field(
+        default=False, 
+        env="ENABLE_JAEGER",
+        description="Enable Jaeger tracing"
+    )
+    jaeger_agent_host: str = Field(
+        default="localhost", 
+        env="JAEGER_AGENT_HOST",
+        description="Jaeger agent hostname"
+    )
+    jaeger_agent_port: int = Field(
+        default=6831, 
+        env="JAEGER_AGENT_PORT",
+        ge=1024,
+        le=65535,
+        description="Jaeger agent port"
+    )
+    log_level: LogLevel = Field(
+        default=LogLevel.INFO, 
+        env="LOG_LEVEL",
+        description="Application log level"
+    )
     
     @validator('log_level')
-    def validate_log_level(cls, v):
-        valid_levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
-        if v.upper() not in valid_levels:
+    def validate_log_level(cls, v: str) -> str:
+        """Validate log level is supported."""
+        try:
+            return LogLevel(v.upper()).value
+        except ValueError:
+            valid_levels = [level.value for level in LogLevel]
             raise ValueError(f"Invalid log level: {v}. Must be one of {valid_levels}")
-        return v.upper()
 
 
-class SecuritySettings(BaseSettings):
+class SecuritySettings(BaseConfig):
     """Security and authentication settings."""
     
-    secret_key: str = Field(default="your-secret-key-here", env="SECRET_KEY")
-    algorithm: str = Field(default="HS256", env="JWT_ALGORITHM")
-    access_token_expire_minutes: int = Field(default=30, env="ACCESS_TOKEN_EXPIRE_MINUTES")
-    enable_auth: bool = Field(default=False, env="ENABLE_AUTH")
-    api_key: Optional[str] = Field(default=None, env="API_KEY")
+    secret_key: str = Field(
+        default="your-secret-key-here", 
+        env="SECRET_KEY",
+        description="Secret key for JWT tokens",
+        min_length=32
+    )
+    algorithm: str = Field(
+        default="HS256", 
+        env="JWT_ALGORITHM",
+        description="JWT algorithm"
+    )
+    access_token_expire_minutes: int = Field(
+        default=30, 
+        env="ACCESS_TOKEN_EXPIRE_MINUTES",
+        ge=1,
+        le=1440,
+        description="JWT token expiration in minutes"
+    )
+    enable_auth: bool = Field(
+        default=False, 
+        env="ENABLE_AUTH",
+        description="Enable authentication"
+    )
+    api_key: Optional[str] = Field(
+        default=None, 
+        env="API_KEY",
+        description="API key for service authentication"
+    )
     
-    class Config:
+    class Config(BaseConfig.Config):
         env_prefix = "SECURITY_"
 
 
-class CloudSettings(BaseSettings):
+class CloudSettings(BaseConfig):
     """Cloud storage and services settings."""
     
     # AWS Settings
-    aws_access_key_id: Optional[str] = Field(default=None, env="AWS_ACCESS_KEY_ID")
-    aws_secret_access_key: Optional[str] = Field(default=None, env="AWS_SECRET_ACCESS_KEY")
-    aws_region: str = Field(default="us-east-1", env="AWS_REGION")
-    s3_bucket: Optional[str] = Field(default=None, env="S3_BUCKET")
+    aws_access_key_id: Optional[str] = Field(
+        default=None, 
+        env="AWS_ACCESS_KEY_ID",
+        description="AWS access key ID"
+    )
+    aws_secret_access_key: Optional[str] = Field(
+        default=None, 
+        env="AWS_SECRET_ACCESS_KEY",
+        description="AWS secret access key"
+    )
+    aws_region: str = Field(
+        default="us-east-1", 
+        env="AWS_REGION",
+        description="AWS region"
+    )
+    s3_bucket: Optional[str] = Field(
+        default=None, 
+        env="S3_BUCKET",
+        description="S3 bucket name"
+    )
     
     # GCP Settings
-    gcp_project_id: Optional[str] = Field(default=None, env="GCP_PROJECT_ID")
-    gcp_credentials_path: Optional[str] = Field(default=None, env="GCP_CREDENTIALS_PATH")
-    gcs_bucket: Optional[str] = Field(default=None, env="GCS_BUCKET")
+    gcp_project_id: Optional[str] = Field(
+        default=None, 
+        env="GCP_PROJECT_ID",
+        description="GCP project ID"
+    )
+    gcp_credentials_path: Optional[str] = Field(
+        default=None, 
+        env="GCP_CREDENTIALS_PATH",
+        description="Path to GCP credentials JSON file"
+    )
+    gcs_bucket: Optional[str] = Field(
+        default=None, 
+        env="GCS_BUCKET",
+        description="GCS bucket name"
+    )
     
     # Azure Settings
-    azure_storage_account: Optional[str] = Field(default=None, env="AZURE_STORAGE_ACCOUNT")
-    azure_storage_key: Optional[str] = Field(default=None, env="AZURE_STORAGE_KEY")
-    azure_container: Optional[str] = Field(default=None, env="AZURE_CONTAINER")
+    azure_storage_account: Optional[str] = Field(
+        default=None, 
+        env="AZURE_STORAGE_ACCOUNT",
+        description="Azure storage account name"
+    )
+    azure_storage_key: Optional[str] = Field(
+        default=None, 
+        env="AZURE_STORAGE_KEY",
+        description="Azure storage account key"
+    )
+    azure_container: Optional[str] = Field(
+        default=None, 
+        env="AZURE_CONTAINER",
+        description="Azure container name"
+    )
     
-    class Config:
+    class Config(BaseConfig.Config):
         env_prefix = "CLOUD_"
 
 
-class DriftDetectionSettings(BaseSettings):
+class DriftDetectionSettings(BaseConfig):
     """Drift detection algorithm configuration."""
     
     # Statistical test thresholds
@@ -145,7 +314,34 @@ class AlertSettings(BaseSettings):
     )
 
 
-class Settings(BaseSettings):
+class BaseConfig(BaseSettings):
+    """Base configuration class with common functionality."""
+    
+    class Config:
+        env_file = ".env"
+        case_sensitive = False
+        extra = "forbid"  # Prevent extra fields
+        
+    def dict_safe(self) -> dict:
+        """Return dictionary with sensitive fields masked."""
+        data = self.dict()
+        sensitive_fields = {'password', 'secret', 'key', 'token'}
+        
+        def mask_sensitive(obj: dict, path: str = "") -> dict:
+            if isinstance(obj, dict):
+                return {
+                    k: mask_sensitive(v, f"{path}.{k}" if path else k)
+                    for k, v in obj.items()
+                }
+            elif any(sensitive in str(path).lower() for sensitive in sensitive_fields):
+                return "***MASKED***" if obj else None
+            else:
+                return obj
+                
+        return mask_sensitive(data)
+
+
+class Settings(BaseConfig):
     """Main application settings."""
     
     # Basic app settings
@@ -192,22 +388,26 @@ class Settings(BaseSettings):
     alerts: AlertSettings = AlertSettings()
     
     @validator('environment')
-    def validate_environment(cls, v):
-        valid_envs = ["development", "staging", "production"]
-        if v not in valid_envs:
+    def validate_environment(cls, v: str) -> str:
+        """Validate environment is supported."""
+        try:
+            return Environment(v).value
+        except ValueError:
+            valid_envs = [env.value for env in Environment]
             raise ValueError(f"Invalid environment: {v}. Must be one of {valid_envs}")
-        return v
     
     @validator('cors_origins', pre=True)
-    def parse_cors_origins(cls, v):
+    def parse_cors_origins(cls, v: str | List[str]) -> List[str]:
+        """Parse CORS origins from string or list."""
         if isinstance(v, str):
-            return [i.strip() for i in v.split(",")]
+            return [i.strip() for i in v.split(",") if i.strip()]
         return v
     
     @validator('allowed_hosts', pre=True)
-    def parse_allowed_hosts(cls, v):
+    def parse_allowed_hosts(cls, v: str | List[str]) -> List[str]:
+        """Parse allowed hosts from string or list."""
         if isinstance(v, str):
-            return [i.strip() for i in v.split(",")]
+            return [i.strip() for i in v.split(",") if i.strip()]
         return v
     
     class Config:

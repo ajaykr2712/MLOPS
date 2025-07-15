@@ -3,21 +3,40 @@ Advanced statistical drift detection algorithms.
 Implements multiple statistical tests for comprehensive drift detection.
 """
 
+from __future__ import annotations
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Any, Union
-from dataclasses import dataclass
+from typing import Dict, List, Optional, Any, Union, Protocol
+from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 from scipy import stats
 from scipy.spatial.distance import jensenshannon
 import warnings
 import logging
+from enum import Enum
 
 warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 
 
-@dataclass
+class DriftSeverity(str, Enum):
+    """Drift severity levels."""
+    NONE = "none"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+class DriftTestType(str, Enum):
+    """Available drift detection tests."""
+    KOLMOGOROV_SMIRNOV = "kolmogorov_smirnov"
+    POPULATION_STABILITY_INDEX = "population_stability_index"
+    JENSEN_SHANNON = "jensen_shannon"
+    CHI_SQUARE = "chi_square"
+    WASSERSTEIN = "wasserstein"
+
+
+@dataclass(frozen=True)
 class DriftResult:
     """Result of drift detection analysis."""
     
@@ -26,11 +45,11 @@ class DriftResult:
     statistic: float
     threshold: float
     is_drift: bool
-    severity: str  # "low", "medium", "high"
+    severity: DriftSeverity
     feature_name: Optional[str] = None
     reference_size: Optional[int] = None
     comparison_size: Optional[int] = None
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation."""
@@ -40,63 +59,140 @@ class DriftResult:
             "statistic": self.statistic,
             "threshold": self.threshold,
             "is_drift": self.is_drift,
-            "severity": self.severity,
+            "severity": self.severity.value,
             "feature_name": self.feature_name,
             "reference_size": self.reference_size,
             "comparison_size": self.comparison_size,
-            "metadata": self.metadata or {}
+            "metadata": self.metadata
         }
+
+
+class DriftDetectorProtocol(Protocol):
+    """Protocol for drift detectors."""
+    
+    def detect(
+        self, 
+        reference: np.ndarray, 
+        comparison: np.ndarray, 
+        feature_name: Optional[str] = None
+    ) -> DriftResult:
+        """Detect drift between reference and comparison datasets."""
+        ...
 
 
 class BaseDriftDetector(ABC):
     """Base class for all drift detectors."""
     
-    def __init__(self, threshold: float = 0.05):
+    def __init__(self, threshold: float = 0.05, name: Optional[str] = None):
+        if not 0 < threshold < 1:
+            raise ValueError("Threshold must be between 0 and 1")
         self.threshold = threshold
+        self.name = name or self.__class__.__name__
     
     @abstractmethod
-    def detect(self, reference: np.ndarray, comparison: np.ndarray, 
-               feature_name: Optional[str] = None) -> DriftResult:
+    def detect(
+        self, 
+        reference: np.ndarray, 
+        comparison: np.ndarray, 
+        feature_name: Optional[str] = None
+    ) -> DriftResult:
         """Detect drift between reference and comparison datasets."""
         pass
     
-    def _calculate_severity(self, statistic: float, p_value: float) -> str:
+    def _validate_inputs(
+        self, 
+        reference: np.ndarray, 
+        comparison: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Validate and clean input arrays."""
+        # Convert to numpy arrays if needed
+        ref_array = np.asarray(reference).flatten()
+        comp_array = np.asarray(comparison).flatten()
+        
+        # Remove NaN values
+        ref_clean = ref_array[~np.isnan(ref_array)]
+        comp_clean = comp_array[~np.isnan(comp_array)]
+        
+        if len(ref_clean) == 0:
+            raise ValueError("Reference data is empty after cleaning")
+        if len(comp_clean) == 0:
+            raise ValueError("Comparison data is empty after cleaning")
+            
+        return ref_clean, comp_clean
+    
+    def _calculate_severity(self, statistic: float, p_value: float) -> DriftSeverity:
         """Calculate drift severity based on statistical measures."""
         if p_value < 0.001 or statistic > 0.7:
-            return "high"
+            return DriftSeverity.HIGH
         elif p_value < 0.01 or statistic > 0.3:
-            return "medium"
+            return DriftSeverity.MEDIUM
         elif p_value < self.threshold or statistic > 0.1:
-            return "low"
-        return "none"
+            return DriftSeverity.LOW
+        return DriftSeverity.NONE
 
 
 class KolmogorovSmirnovDetector(BaseDriftDetector):
     """Kolmogorov-Smirnov two-sample test for continuous variables."""
     
-    def detect(self, reference: np.ndarray, comparison: np.ndarray, 
-               feature_name: Optional[str] = None) -> DriftResult:
+    def __init__(self, threshold: float = 0.05, alternative: str = "two-sided"):
+        super().__init__(threshold, "Kolmogorov-Smirnov")
+        if alternative not in ["two-sided", "less", "greater"]:
+            raise ValueError("Alternative must be 'two-sided', 'less', or 'greater'")
+        self.alternative = alternative
+    
+    def detect(
+        self, 
+        reference: np.ndarray, 
+        comparison: np.ndarray, 
+        feature_name: Optional[str] = None
+    ) -> DriftResult:
         """Apply KS test to detect distribution drift."""
-        # Remove NaN values
-        ref_clean = reference[~np.isnan(reference)]
-        comp_clean = comparison[~np.isnan(comparison)]
-        
-        if len(ref_clean) == 0 or len(comp_clean) == 0:
+        try:
+            ref_clean, comp_clean = self._validate_inputs(reference, comparison)
+            
+            # Perform KS test
+            statistic, p_value = stats.ks_2samp(
+                ref_clean, 
+                comp_clean, 
+                alternative=self.alternative
+            )
+            
+            is_drift = p_value < self.threshold
+            severity = self._calculate_severity(statistic, p_value)
+            
             return DriftResult(
-                test_name="Kolmogorov-Smirnov",
+                test_name=self.name,
+                p_value=p_value,
+                statistic=statistic,
+                threshold=self.threshold,
+                is_drift=is_drift,
+                severity=severity,
+                feature_name=feature_name,
+                reference_size=len(reference),
+                comparison_size=len(comparison),
+                metadata={
+                    "alternative": self.alternative,
+                    "reference_mean": float(np.mean(ref_clean)),
+                    "comparison_mean": float(np.mean(comp_clean)),
+                    "reference_std": float(np.std(ref_clean)),
+                    "comparison_std": float(np.std(comp_clean))
+                }
+            )
+            
+        except Exception as e:
+            logger.error(f"KS test failed: {str(e)}")
+            return DriftResult(
+                test_name=self.name,
                 p_value=1.0,
                 statistic=0.0,
                 threshold=self.threshold,
                 is_drift=False,
-                severity="none",
+                severity=DriftSeverity.NONE,
                 feature_name=feature_name,
                 reference_size=len(reference),
                 comparison_size=len(comparison),
-                metadata={"error": "Empty datasets after cleaning"}
+                metadata={"error": str(e)}
             )
-        
-        # Perform KS test
-        statistic, p_value = stats.ks_2samp(ref_clean, comp_clean)
         
         is_drift = p_value < self.threshold
         severity = self._calculate_severity(statistic, p_value)

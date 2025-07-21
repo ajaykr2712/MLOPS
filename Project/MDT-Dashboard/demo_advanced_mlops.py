@@ -20,7 +20,7 @@ def demonstrate_neural_networks():
     
     try:
         from src.mdt_dashboard.ml_pipeline.neural_networks import (
-            ModelArchitectureConfig, TransformerModel, FoundationModelTrainer
+            ModelArchitectureConfig, FoundationModelTrainer
         )
         
         # Transformer configuration
@@ -202,7 +202,7 @@ def demonstrate_vector_databases():
     
     try:
         from src.mdt_dashboard.ml_pipeline.vector_store import (
-            VectorConfig, VectorFeatureStore, VectorSearchEngine
+            VectorConfig, VectorFeatureStore
         )
         
         # Vector database configuration

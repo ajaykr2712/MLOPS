@@ -80,9 +80,13 @@ def demonstrate_distributed_training():
         # Create training manager
         trainer = DistributedTrainingManager(config)
         
+        # Demo training setup (would include actual model training in production)
+        # trainer.setup_distributed_training()
+        
         logger.info("✅ Distributed training manager created")
         logger.info(f"   - World size: {config.world_size}")
         logger.info(f"   - Backend: {config.backend}")
+        logger.info("   - Training manager ready for distributed execution")
         logger.info(f"   - Mixed precision: {config.mixed_precision}")
         
         # Auto-scaler
@@ -116,13 +120,17 @@ def demonstrate_advanced_evaluation():
         # Create evaluator
         evaluator = ModelEvaluator(config)
         
-        # Generate dummy data for demo
+        # Generate dummy data for demo (would be actual data in production)
         X_test = np.random.randn(100, 10)
         y_test = np.random.randint(0, 2, 100)
+        
+        # Demo evaluation (commented out for brevity)
+        # results = evaluator.comprehensive_evaluation(model, X_test, y_test)
         
         logger.info("✅ Advanced evaluation configured")
         logger.info(f"   - Metrics: {config.metrics}")
         logger.info(f"   - Cross-validation: {config.cv_folds} folds")
+        logger.info(f"   - Test data shape: {X_test.shape}, Labels: {y_test.shape}")
         logger.info(f"   - Fairness evaluation: {config.evaluate_fairness}")
         logger.info(f"   - Robustness testing: {config.test_noise_robustness}")
         logger.info(f"   - Explanation methods: {config.explanation_methods}")

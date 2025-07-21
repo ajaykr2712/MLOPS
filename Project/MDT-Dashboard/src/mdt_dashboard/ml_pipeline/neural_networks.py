@@ -297,6 +297,69 @@ class MultimodalModel(nn.Module):
         return self.classifier(fused_features)
 
 
+class CrossModalTransformer(nn.Module):
+    """Cross-modal transformer for advanced multimodal fusion."""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        
+        # Cross-attention layers
+        self.cross_attention = nn.ModuleList([
+            nn.MultiheadAttention(
+                config.fusion_dim, 
+                num_heads=getattr(config, 'num_heads', 8),
+                dropout=getattr(config, 'dropout', 0.1)
+            )
+            for _ in range(getattr(config, 'num_cross_layers', 4))
+        ])
+        
+        # Layer norms
+        self.layer_norms = nn.ModuleList([
+            nn.LayerNorm(config.fusion_dim)
+            for _ in range(getattr(config, 'num_cross_layers', 4) * 2)
+        ])
+        
+        # Feed-forward networks
+        self.ffns = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(config.fusion_dim, config.fusion_dim * 4),
+                nn.GELU(),
+                nn.Dropout(getattr(config, 'dropout', 0.1)),
+                nn.Linear(config.fusion_dim * 4, config.fusion_dim)
+            )
+            for _ in range(getattr(config, 'num_cross_layers', 4))
+        ])
+        
+        # Input projections
+        self.vision_proj = nn.Linear(getattr(config, 'vision_dim', 768), config.fusion_dim)
+        self.text_proj = nn.Linear(getattr(config, 'text_dim', 768), config.fusion_dim)
+        
+    def forward(self, vision_features, text_features):
+        """Cross-modal transformer forward pass."""
+        # Project to common dimension
+        v_features = self.vision_proj(vision_features).unsqueeze(0)  # [1, B, D]
+        t_features = self.text_proj(text_features).unsqueeze(0)      # [1, B, D]
+        
+        # Cross-modal attention layers
+        for i, (cross_attn, ffn) in enumerate(zip(self.cross_attention, self.ffns)):
+            # Vision attends to text
+            v_attended, _ = cross_attn(v_features, t_features, t_features)
+            v_features = self.layer_norms[i*2](v_features + v_attended)
+            
+            # Text attends to vision
+            t_attended, _ = cross_attn(t_features, v_features, v_features)
+            t_features = self.layer_norms[i*2+1](t_features + t_attended)
+            
+            # Feed-forward
+            v_features = v_features + ffn(v_features)
+            t_features = t_features + ffn(t_features)
+        
+        # Combine features (average pooling)
+        combined = (v_features + t_features) / 2
+        return combined.squeeze(0)
+
+
 class MultimodalAttention(nn.Module):
     """Attention-based multimodal fusion."""
     
